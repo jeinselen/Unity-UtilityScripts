@@ -53,6 +53,17 @@ public class SplinePanel : MonoBehaviour
 	private bool prevCalculateNormals, prevcalculateUV;
 	private bool needsRebuild = true;
 	
+	// Optimized data structures - reused to avoid allocations
+	private readonly List<float> xListCache = new List<float>(128);
+	private readonly List<Vector3> vertsCache = new List<Vector3>(256);
+	private readonly List<Vector2> uvsCache = new List<Vector2>(256);
+	private readonly List<int> trisCache = new List<int>(384);
+	
+	// Pre-computed trigonometry cache
+	private float[] cosCache;
+	private float[] sinCache;
+	private int cachedCornerSegments = -1;
+	
 	private void EnsureMesh()
 	{
 		var mf = GetComponent<MeshFilter>();
@@ -73,6 +84,31 @@ public class SplinePanel : MonoBehaviour
 		if (mf.sharedMesh != mesh)
 		{
 			mf.sharedMesh = mesh;
+		}
+	}
+	
+	private void PrecomputeTrigonometry()
+	{
+		if (cachedCornerSegments == cornerSegments && cosCache != null)
+		return;
+		
+		cachedCornerSegments = cornerSegments;
+		int arraySize = cornerSegments + 1;
+		
+		if (cosCache == null || cosCache.Length != arraySize)
+		{
+			cosCache = new float[arraySize];
+			sinCache = new float[arraySize];
+		}
+		
+		const float halfPi = math.PI * 0.5f;
+		float invSegments = 1f / cornerSegments;
+		
+		for (int i = 0; i <= cornerSegments; i++)
+		{
+			float angle = halfPi + (i * invSegments) * halfPi;
+			cosCache[i] = math.cos(angle);
+			sinCache[i] = math.sin(angle);
 		}
 	}
 	
@@ -192,41 +228,35 @@ public class SplinePanel : MonoBehaviour
 			//mesh.vertices = new Vector3[] {new Vector3(1f, 0f, 0f), new Vector3(0f, 0f, 0f), new Vector3(0f, 1f, 0f)};
 			mesh.uv = new Vector2[] {new Vector2(0, 0), new Vector2(0, 1), new Vector2(1, 1)};
 			mesh.triangles =  new int[] {0, 1, 2};
+			mesh.bounds = new Bounds(Vector3.zero, Vector3.zero);
 		}
 		else
 		{
-			// Create new list instead of reusing
-			List<float> xList = new List<float>();
-			
-			// Initialise variables for advanced mesh generation
 			float halfW = width * 0.5f;
 			float halfH = height * 0.5f;
+			//float r = math.min(math.max(0f, cornerRadius), math.min(halfW, halfH));
 			float r = Mathf.Min(cornerRadius, halfW, halfH);
 			
 			float innerMinX = -halfW + r;
 			float innerMaxX = halfW - r;
 			
-			// Generate corner arc X positions
+			// Precompute trigonometry
+			PrecomputeTrigonometry();
+			
+			// Clear and reuse cached collections
+			xListCache.Clear();
+			
+			// Generate corner arc X positions using cached trigonometry
 			for (int i = 0; i <= cornerSegments; i++)
 			{
-				float t = i / (float)cornerSegments;
-				float ang = Mathf.PI * 0.5f + t * (Mathf.PI * 0.5f);
-				float offset = Mathf.Cos(ang) * r;
+				float offset = cosCache[i] * r;
 				float xL = innerMinX + offset;
 				float xR = -xL;
-				xList.Add(xL);
-				xList.Add(xR);
+				xListCache.Add(xL);
+				xListCache.Add(xR);
 			}
 			
-			// Add straight-wall subdivisions
-			
-			//if (subdivisionSize > minDistance && innerMaxX > innerMinX)
-			//{
-			//	for (float x = innerMinX; x < innerMaxX; x += subdivisionSize)
-			//	xList.Add(x);
-			//	xList.Add(innerMaxX);
-			//}
-			
+			// Add straight-wall subdivisions with equal spacing based on input distance
 			if (subdivisionSize > 0f && innerMaxX > innerMinX)
 			{
 				int subdivCount = math.max(1, (int)math.ceil((innerMaxX - innerMinX) / subdivisionSize));
@@ -234,25 +264,21 @@ public class SplinePanel : MonoBehaviour
 				
 				for (int i = 0; i < subdivCount; i++)
 				{
-					xList.Add(innerMinX + i * actualSubdivSize);
+					xListCache.Add(innerMinX + i * actualSubdivSize);
 				}
-				xList.Add(innerMaxX);
+				xListCache.Add(innerMaxX);
 			}
 			
 			// Sort and remove duplicates
-			xList.Sort();
-			//for (int i = xList.Count - 1; i > 0; i--)
-			//{
-			//	if (math.abs(xList[i] - xList[i - 1]) < minDistance)
-			//	xList.RemoveAt(i);
-			//}
+			xListCache.Sort();
 			
-			int cols = xList.Count;
+			int cols = xListCache.Count;
 			
-			// Create lists
-			List<Vector3> verts = new List<Vector3>(cols * 2);
-			List<Vector2> uvs = new List<Vector2>(cols * 2);
-			List<int> tris = new List<int>((cols - 1) * 6);
+			// Clear and prepare vertex/UV caches
+			vertsCache.Clear();
+			vertsCache.Capacity = math.max(vertsCache.Capacity, cols * 2);
+			uvsCache.Clear();
+			uvsCache.Capacity = math.max(uvsCache.Capacity, cols * 2);
 			
 			// Build vertices and UVs
 			float invWidth = 1f / math.max(width, 1e-6f);
@@ -261,7 +287,7 @@ public class SplinePanel : MonoBehaviour
 			
 			for (int i = 0; i < cols; i++)
 			{
-				float x = xList[i];
+				float x = xListCache[i];
 				float absX = math.abs(x);
 				float dx = math.max(0f, absX - innerMaxX);
 				
@@ -288,18 +314,18 @@ public class SplinePanel : MonoBehaviour
 					yBot = -halfH + r - d;
 				}
 				
-				verts.Add(new Vector3(x, yBot, 0f));
-				verts.Add(new Vector3(x, yTop, 0f));
+				vertsCache.Add(new Vector3(x, yBot, 0f));
+				vertsCache.Add(new Vector3(x, yTop, 0f));
 				
 				if (calculateUV)
 				{
-					uvs.Add(new Vector2((x + halfW) * invWidth, (yBot + halfH) * invHeight));
-					uvs.Add(new Vector2((x + halfW) * invWidth, (yTop + halfH) * invHeight));
+					uvsCache.Add(new Vector2((x + halfW) * invWidth, (yBot + halfH) * invHeight));
+					uvsCache.Add(new Vector2((x + halfW) * invWidth, (yTop + halfH) * invHeight));
 				}
 			}
 			
 			// Spline deformation
-			if (splineContainer != null && splineContainer.Splines != null && splineContainer.Splines.Count > 0 && verts.Count > 0)
+			if (splineContainer != null && splineContainer.Splines != null && splineContainer.Splines.Count > 0 && vertsCache.Count > 0)
 			{
 				using (var nativeSpline = new NativeSpline(splineContainer.Splines[0], splineContainer.transform.localToWorldMatrix, Allocator.Temp))
 				{
@@ -311,17 +337,21 @@ public class SplinePanel : MonoBehaviour
 						float baseOffset = splinePosition * (splineLength - width) + halfW;
 						float invSplineLength = 1f / splineLength;
 						
-						for (int i = 0; i < verts.Count; i++)
+						for (int i = 0; i < vertsCache.Count; i++)
 						{
-							Vector3 v = verts[i];
-							//float t = math.min(math.max((v.x + baseOffset) * invSplineLength, 0f), 0.99999994f);
-							float t = (v.x + baseOffset) * invSplineLength;
+							Vector3 v = vertsCache[i];
+							float t = math.min(math.max((v.x + baseOffset) * invSplineLength, 0f), 0.99999994f);
+							//float t = (v.x + baseOffset) * invSplineLength;
 							Vector3 samplePos = nativeSpline.EvaluatePosition(t);
-							verts[i] = samplePos + new Vector3(0f, v.y, 0f);
+							vertsCache[i] = samplePos + new Vector3(0f, v.y, 0f);
 						}
 					}
 				}
 			}
+			
+			// Build triangles
+			trisCache.Clear();
+			trisCache.Capacity = math.max(trisCache.Capacity, (cols - 1) * 6);
 			
 			for (int i = 0; i < cols - 1; i++)
 			{
@@ -331,24 +361,42 @@ public class SplinePanel : MonoBehaviour
 				int tr = br + 1;
 				
 				// First triangle
-				tris.Add(bl);
-				tris.Add(tl);
-				tris.Add(tr);
+				trisCache.Add(bl);
+				trisCache.Add(tl);
+				trisCache.Add(tr);
 				
 				// Second triangle
-				tris.Add(bl);
-				tris.Add(tr);
-				tris.Add(br);
+				trisCache.Add(bl);
+				trisCache.Add(tr);
+				trisCache.Add(br);
 			}
 			
-			// Assign to mesh
-			mesh.SetVertices(verts);
-			mesh.SetTriangles(tris, 0);
-			mesh.SetUVs(0, uvs);
+			// Set blank UV0 if disabled or null
+			if (!calculateUV || uvsCache == null || uvsCache.Count != vertsCache.Count)
+			{
+				uvsCache.Clear();
+				for (int i = 0; i < vertsCache.Count; i++) uvsCache.Add(Vector2.zero);
+			}
+			
+			// Assign mesh and UV0
+			mesh.SetVertices(vertsCache);
+			mesh.SetTriangles(trisCache, 0);
+			mesh.SetUVs(0, uvsCache);
+			
+			// Rebind normals
+			if (calculateNormals && vertsCache.Count > 0 && trisCache.Count > 0)
+			{
+				mesh.RecalculateNormals();
+			}
+			else
+			{
+				var normalsFallback = new System.Collections.Generic.List<Vector3>(vertsCache.Count);
+				for (int i = 0; i < vertsCache.Count; i++) normalsFallback.Add(Vector3.forward);
+				mesh.SetNormals(normalsFallback);
+			}
+			
+			mesh.RecalculateBounds();
 		}
-		
-		// Calculate normals and boundary
-		mesh.RecalculateNormals();
-		mesh.RecalculateBounds();
 	}
 }
+	
