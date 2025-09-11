@@ -30,20 +30,26 @@ public class SpatialUITrigger : MonoBehaviour
 	{
 		if (Keyboard.current != null && Keyboard.current[keyboardKey].wasPressedThisFrame)
 		{
-			Debug.Log("Press Start");
+//			Debug.Log("Press Start");
+			m_PressStart.Invoke();
+		}
+		if (Keyboard.current != null && Keyboard.current[keyboardKey].wasReleasedThisFrame)
+		{
+//			Debug.Log("Press Start");
+			m_PressEnd.Invoke();
 			TriggerEvent();
 		}
 	}
 	
 	public virtual void PressStart()
 	{
-		Debug.Log("Press Start");
+//		Debug.Log("Press Start");
 		m_PressStart.Invoke();
 	}
 	
 	public virtual void PressEnd()
 	{
-		Debug.Log("Press End");
+//		Debug.Log("Press End");
 		m_PressEnd.Invoke();
 		TriggerEvent();
 	}
